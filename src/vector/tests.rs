@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::SCALE;
 
     const BASELINE: &[u8] = br#"{"id":"tx-1","transaction":{"amount":384.88,"installments":3,"requested_at":"2026-03-11T20:23:35Z"},"customer":{"avg_amount":769.76,"tx_count_24h":3,"known_merchants":["MERC-009","MERC-001"]},"merchant":{"id":"MERC-001","mcc":"5912","avg_amount":298.95},"terminal":{"is_online":false,"card_present":true,"km_from_home":13.70},"last_transaction":{"timestamp":"2026-03-11T14:58:35Z","km_from_current":18.86}}"#;
 
