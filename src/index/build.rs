@@ -82,6 +82,7 @@ struct NodeEntry {
     len: usize,
     min: QueryVector,
     max: QueryVector,
+    class_bits: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,27 +94,31 @@ enum KdSplitStrategy {
 pub fn build_index(
     references: Vec<Reference>,
     leaf_size: usize,
-    scheme: PartitionScheme,
+    mut scheme: PartitionScheme,
 ) -> Result<Vec<u8>, String> {
     let leaf_size = leaf_size.clamp(LANES, 2048);
     let split_strategy = kd_split_strategy();
 
+    scheme.prepare(&references);
     let cuts = scheme.compute_cuts(&references);
     eprintln!(
-        "[build] scheme={} amount_cuts={} dow_cuts={} total_cuts={} (persisted in header), kd_split={:?}",
+        "[build] scheme={} scheme_id={} tree_depth={} (persisted in header), kd_split={:?}",
         scheme.name,
-        scheme.amount_cut_count,
-        scheme.dow_cut_count,
-        cuts.len(),
+        scheme.scheme_id(),
+        scheme.tree_depth,
         split_strategy
     );
 
     let mut writer = IndexWriter::new();
     writer.write_header(
         references.len() as i32,
-        scheme.amount_cut_count as i16,
-        scheme.dow_cut_count as i16,
+        scheme.scheme_id(),
+        scheme.tree_depth as i16,
+        0,
+        0,
         &cuts,
+        &[],
+        &scheme.tree_predicates,
     )?;
 
     let mut partitions: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -122,7 +127,7 @@ pub fn build_index(
         partitions.entry(key).or_default().push(idx);
     }
 
-    let mut all_blocks: Vec<(QueryVector, u8)> = Vec::new();
+    let mut all_blocks: Vec<(QueryVector, u8, u32)> = Vec::new();
     let mut nodes: Vec<NodeEntry> = Vec::new();
     let mut partition_meta: Vec<(u32, usize)> = Vec::new();
 
@@ -168,19 +173,32 @@ pub fn build_index(
     writer.write_block_count(total_blocks as i32)?;
 
     for b in 0..total_blocks {
-        for d in 0..DIMS {
+        for pair in 0..(DIMS / 2) {
             for l in 0..LANES {
-                let (vec, _) = all_blocks[b * LANES + l];
-                writer.write_i16(vec[d])?;
+                let (vec, _, _) = all_blocks[b * LANES + l];
+                writer.write_i16(vec[pair * 2])?;
+                writer.write_i16(vec[pair * 2 + 1])?;
             }
         }
     }
 
     for b in 0..total_blocks {
         for l in 0..LANES {
-            let (_, label) = all_blocks[b * LANES + l];
+            let (_, label, _) = all_blocks[b * LANES + l];
             writer.write_u8(label)?;
         }
+    }
+
+    writer.align_to(std::mem::align_of::<u32>());
+    for b in 0..total_blocks {
+        for l in 0..LANES {
+            let (_, _, ref_index) = all_blocks[b * LANES + l];
+            writer.write_u32(ref_index)?;
+        }
+    }
+
+    for node in &nodes {
+        writer.write_u8(node.class_bits)?;
     }
 
     Ok(writer.into_bytes())
@@ -191,7 +209,7 @@ fn build_node(
     indices: &[usize],
     leaf_size: usize,
     split_strategy: KdSplitStrategy,
-    all_blocks: &mut Vec<(QueryVector, u8)>,
+    all_blocks: &mut Vec<(QueryVector, u8, u32)>,
     nodes: &mut Vec<NodeEntry>,
 ) -> usize {
     let mut min = [i16::MAX; PACKED_DIMS];
@@ -212,20 +230,24 @@ fn build_node(
         len: 0,
         min,
         max,
+        class_bits: 0,
     });
 
     if indices.len() <= leaf_size {
         let leaf_start = all_blocks.len();
         let blocks = (indices.len() + LANES - 1) / LANES;
+        let mut class_bits = 0u8;
 
         for b in 0..blocks {
             for l in 0..LANES {
                 let i = b * LANES + l;
                 if i < indices.len() {
-                    let ref_item = &references[indices[i]];
-                    all_blocks.push((ref_item.vector, ref_item.label));
+                    let ref_idx = indices[i];
+                    let ref_item = &references[ref_idx];
+                    class_bits |= 1u8 << ref_item.label.min(7);
+                    all_blocks.push((ref_item.vector, ref_item.label, ref_idx as u32));
                 } else {
-                    all_blocks.push(([0i16; PACKED_DIMS], 0u8));
+                    all_blocks.push(([0i16; PACKED_DIMS], 0u8, u32::MAX));
                 }
             }
         }
@@ -237,6 +259,7 @@ fn build_node(
             len: indices.len(),
             min,
             max,
+            class_bits,
         };
         return node_idx;
     }
@@ -280,6 +303,7 @@ fn build_node(
         len: left_info.len + right_info.len,
         min,
         max,
+        class_bits: left_info.class_bits | right_info.class_bits,
     };
 
     node_idx

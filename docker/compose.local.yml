@@ -21,8 +21,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "165M"
+          cpus: "0.49"
+          memory: "170M"
 
   api2:
     image: rinha-rust-tree-api:local
@@ -46,8 +46,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "165M"
+          cpus: "0.49"
+          memory: "170M"
 
   lb:
     image: rinha-rust-tree-lb:local
@@ -67,8 +67,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "20M"
+          cpus: "0.02"
+          memory: "10M"
+networks:
+  rinha:
+    driver: bridge
 
 volumes:
   sockets:

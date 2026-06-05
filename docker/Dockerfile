@@ -26,7 +26,7 @@ ARG REFERENCES_URL=https://github.com/zanfranceschi/rinha-de-backend-2026/raw/ma
 RUN curl -L -o /app/references.json.gz ${REFERENCES_URL}
 
 ARG RINHA_NATIVE_LEAF_SIZE=64
-ARG RINHA_PARTITION_SCHEME=amt16_dow7
+ARG RINHA_PARTITION_SCHEME=tree256
 RUN mkdir -p /app/index && \
     RINHA_LEAF_SIZE=${RINHA_NATIVE_LEAF_SIZE} \
     RINHA_PARTITION_SCHEME=${RINHA_PARTITION_SCHEME} \

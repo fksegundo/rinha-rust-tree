@@ -41,12 +41,16 @@ fn run_single(args: &[String]) {
         .expect("entries array");
 
     let mut queries: Vec<[i16; 16]> = Vec::with_capacity(entries.len());
+    let mut expected_counts: Vec<Option<u8>> = Vec::with_capacity(entries.len());
+    let mut expected_approved: Vec<Option<bool>> = Vec::with_capacity(entries.len());
     for entry in entries {
         let request = entry.get("request").expect("entry.request");
         let body = serde_json::to_vec(request).expect("serialize request");
         let mut q = [0i16; 16];
         if vector::parse_query(&body, &mut q).is_ok() {
             queries.push(q);
+            expected_counts.push(expected_count(entry));
+            expected_approved.push(entry.get("expected_approved").and_then(|v| v.as_bool()));
         }
     }
     eprintln!("parsed {} queries from {}", queries.len(), json_path);
@@ -55,14 +59,31 @@ fn run_single(args: &[String]) {
     let mut leaves: Vec<u32> = Vec::with_capacity(queries.len());
     let mut parts: Vec<u32> = Vec::with_capacity(queries.len());
     let mut secondaries: Vec<u32> = Vec::with_capacity(queries.len());
+    let mut score_matches = 0usize;
+    let mut score_total = 0usize;
+    let mut approved_matches = 0usize;
+    let mut approved_total = 0usize;
     let mut checksum: u64 = 0;
-    for q in &queries {
+    for (i, q) in queries.iter().enumerate() {
         let (c, s) = index.predict_fraud_count_with_stats(q);
         checksum = checksum.wrapping_add(c as u64);
         blocks.push(s.blocks_scanned);
         leaves.push(s.leaves_scanned);
         parts.push(s.partitions_visited);
         secondaries.push(s.secondary_partitions);
+
+        if let Some(expected) = expected_counts[i] {
+            score_total += 1;
+            if c == expected {
+                score_matches += 1;
+            }
+        }
+        if let Some(expected) = expected_approved[i] {
+            approved_total += 1;
+            if (c < 3) == expected {
+                approved_matches += 1;
+            }
+        }
     }
 
     let mut ns: Vec<u64> = Vec::with_capacity(queries.len() * repeats);
@@ -82,6 +103,32 @@ fn run_single(args: &[String]) {
     report_u32("leaves_scanned", &mut leaves);
     report_u32("partitions_visited", &mut parts);
     report_u32("secondary_partitions", &mut secondaries);
+    if score_total > 0 {
+        println!(
+            "  score_accuracy      {}/{} ({:.4}%)",
+            score_matches,
+            score_total,
+            score_matches as f64 * 100.0 / score_total as f64
+        );
+    }
+    if approved_total > 0 {
+        println!(
+            "  approved_accuracy   {}/{} ({:.4}%)",
+            approved_matches,
+            approved_total,
+            approved_matches as f64 * 100.0 / approved_total as f64
+        );
+    }
+}
+
+fn expected_count(entry: &serde_json::Value) -> Option<u8> {
+    let score = entry.get("expected_fraud_score")?.as_f64()?;
+    let count = (score * 5.0).round();
+    if (0.0..=5.0).contains(&count) {
+        Some(count as u8)
+    } else {
+        None
+    }
 }
 
 fn run_compare(args: &[String]) {
@@ -175,7 +222,7 @@ fn run_compare(args: &[String]) {
     println!("{}", "-".repeat(89));
 
     let temp_idx_path = format!("/tmp/rinha-measure-search-{}.idx", std::process::id());
-    let schemes = ["legacy_r2", "amt16_dow7", "amt32_dow7", "amt32_only"];
+    let schemes = ["tree256"];
     let split_strategies: &[&str] = match split_strategy.as_str() {
         "both" => &["widest", "variance"],
         "variance" => &["variance"],

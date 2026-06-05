@@ -21,14 +21,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
 
-    let scheme_name =
-        env::var("RINHA_PARTITION_SCHEME").unwrap_or_else(|_| "amt16_dow7".to_string());
+    let scheme_name = env::var("RINHA_PARTITION_SCHEME").unwrap_or_else(|_| "tree256".to_string());
     let scheme = PartitionScheme::by_name(&scheme_name).unwrap_or_else(|| {
         eprintln!(
-            "Warning: Unknown partition scheme '{}', using recommended 'amt16_dow7'",
+            "Warning: Unknown partition scheme '{}', using recommended 'tree256'",
             scheme_name
         );
-        PartitionScheme::recommended()
+        PartitionScheme::by_name("tree256").unwrap()
     });
 
     eprintln!(

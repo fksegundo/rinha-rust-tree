@@ -9,6 +9,7 @@ const LISTENER_TOKEN: u64 = u64::MAX;
 const MAX_EVENTS: i32 = 256;
 const RECV_FD_BUDGET_DEFAULT: i32 = 32;
 const MAX_CLIENT_FD: usize = 65_536;
+const MAX_PIPELINED_RESPONSES: usize = 64;
 
 #[repr(C)]
 struct EpollParams {
@@ -118,13 +119,61 @@ enum ConnState {
     },
     Writing {
         buf: Box<[u8; BUF_SIZE]>,
-        responses: Vec<&'static [u8]>,
+        responses: ResponseBatch,
         written: usize,
         leftover_off: usize,
         leftover_len: usize,
         keep_alive: bool,
     },
 }
+
+#[derive(Clone, Copy)]
+struct ResponseBatch {
+    items: [&'static [u8]; MAX_PIPELINED_RESPONSES],
+    len: usize,
+}
+
+impl ResponseBatch {
+    fn new() -> Self {
+        Self {
+            items: [EMPTY_RESPONSE; MAX_PIPELINED_RESPONSES],
+            len: 0,
+        }
+    }
+
+    fn single(response: &'static [u8]) -> Self {
+        let mut batch = Self::new();
+        let _ = batch.push(response);
+        batch
+    }
+
+    #[inline(always)]
+    fn push(&mut self, response: &'static [u8]) -> bool {
+        if self.len == self.items.len() {
+            return false;
+        }
+        self.items[self.len] = response;
+        self.len += 1;
+        true
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[&'static [u8]] {
+        &self.items[..self.len]
+    }
+
+    #[inline(always)]
+    fn total_len(&self) -> usize {
+        self.as_slice().iter().map(|r| r.len()).sum()
+    }
+}
+
+const EMPTY_RESPONSE: &'static [u8] = &[];
 
 pub fn run_fd_evented_server<F>(socket_path: &str, handler: F)
 where
@@ -395,7 +444,7 @@ fn drive_reading(
                 handler,
                 conns,
                 buf,
-                vec![http::RESPONSE_BAD_REQUEST],
+                ResponseBatch::single(http::RESPONSE_BAD_REQUEST),
                 0,
                 0,
                 false,
@@ -404,7 +453,7 @@ fn drive_reading(
         }
 
         let mut processed = 0usize;
-        let mut responses = Vec::new();
+        let mut responses = ResponseBatch::new();
         let mut keep_alive = true;
 
         while processed < used {
@@ -415,14 +464,17 @@ fn drive_reading(
                     keep_alive: req_keep_alive,
                 } => {
                     processed += consumed;
-                    responses.push(response);
+                    if !responses.push(response) {
+                        keep_alive = false;
+                        break;
+                    }
                     if !req_keep_alive {
                         keep_alive = false;
                     }
                 }
                 BufferStep::RejectAndClose { response } => {
                     processed = used;
-                    responses.push(response);
+                    let _ = responses.push(response);
                     keep_alive = false;
                     break;
                 }
@@ -465,7 +517,7 @@ fn start_write(
     handler: &Arc<Handler>,
     conns: &mut ConnTable,
     buf: Box<[u8; BUF_SIZE]>,
-    responses: Vec<&'static [u8]>,
+    responses: ResponseBatch,
     leftover_off: usize,
     leftover_len: usize,
     keep_alive: bool,
@@ -571,14 +623,14 @@ fn finish_write(
         return WriteOutcome::Closed;
     };
 
-    let total_len: usize = responses.iter().map(|r| r.len()).sum();
+    let total_len = responses.total_len();
 
     loop {
         let mut iovs = [libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; 32];
-        let iov_cnt = build_iovecs(&responses, written, &mut iovs);
+        let iov_cnt = build_iovecs(responses.as_slice(), written, &mut iovs);
         if iov_cnt == 0 {
             if leftover_len > 0 {
                 buf.copy_within(leftover_off..leftover_off + leftover_len, 0);

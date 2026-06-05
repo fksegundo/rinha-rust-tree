@@ -1,3 +1,4 @@
+use crate::index::partition_scheme::{LearnedPredicate, TreePredicate};
 use crate::{PACKED_DIMS, SCALE};
 
 pub struct IndexWriter {
@@ -12,21 +13,39 @@ impl IndexWriter {
     pub fn write_header(
         &mut self,
         reference_count: i32,
+        scheme_id: i16,
+        scheme_param: i16,
         amount_cut_count: i16,
         dow_cut_count: i16,
         cuts: &[i16],
+        learned_predicates: &[LearnedPredicate],
+        tree_predicates: &[TreePredicate],
     ) -> Result<(), String> {
-        self.buf.extend_from_slice(b"RNSPCST3");
+        self.buf.extend_from_slice(b"RNSPCST5");
         self.write_i32(SCALE as i32)?;
         self.write_i32(PACKED_DIMS as i32)?;
         self.write_i32(reference_count)?;
         self.write_i32(0)?;
         self.write_i32(0)?;
         self.write_i32(0)?;
+        self.write_i16(scheme_id)?;
+        self.write_i16(scheme_param)?;
         self.write_i16(amount_cut_count)?;
         self.write_i16(dow_cut_count)?;
+        let predicate_count = learned_predicates.len() + tree_predicates.len();
+        self.write_i16(predicate_count as i16)?;
         for &c in cuts {
             self.write_i16(c)?;
+        }
+        for predicate in learned_predicates {
+            self.write_u8(predicate.dim)?;
+            self.write_u8(1)?;
+            self.write_i16(predicate.threshold)?;
+        }
+        for predicate in tree_predicates {
+            self.write_u8(predicate.dim)?;
+            self.write_u8(u8::from(predicate.enabled))?;
+            self.write_i16(predicate.threshold)?;
         }
         Ok(())
     }
@@ -102,11 +121,16 @@ impl IndexWriter {
         Ok(())
     }
 
+    pub fn align_to(&mut self, align: usize) {
+        let padding = (align - (self.buf.len() % align)) % align;
+        self.buf.resize(self.buf.len() + padding, 0);
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
 
-    fn write_u32(&mut self, v: u32) -> Result<(), String> {
+    pub fn write_u32(&mut self, v: u32) -> Result<(), String> {
         self.buf.extend_from_slice(&v.to_le_bytes());
         Ok(())
     }

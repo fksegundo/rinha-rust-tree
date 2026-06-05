@@ -19,11 +19,18 @@ use std::mem::{self, MaybeUninit};
 use std::os::fd::AsRawFd;
 use std::ptr;
 use std::slice;
-const MAGIC_V3: &[u8; 8] = b"RNSPCST3";
+const MAGIC_V5: &[u8; 8] = b"RNSPCST5";
 const LANES: usize = 8;
-const KEY_LOOKUP_SIZE: usize = 256;
+const DIM_PAIRS: usize = DIMS / 2;
+const KEY_LOOKUP_SIZE: usize = 1024;
 const MAX_PARTITIONS: usize = KEY_LOOKUP_SIZE;
 const TREE_STACK_CAPACITY: usize = 128;
+const DEFER_STACK_CAPACITY: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexFormat {
+    V5,
+}
 
 pub struct SpecialistIndex {
     _mapping: MmapRegion,
@@ -32,9 +39,8 @@ pub struct SpecialistIndex {
     partition_count: usize,
     key_to_partition: [i32; KEY_LOOKUP_SIZE],
     active_keys: Vec<u32>,
-    amount_cuts: Vec<i16>,
-    dow_cuts: Vec<i16>,
-    dow_shift: u32,
+    partition_scheme: partition_scheme::PartitionScheme,
+    cuts: Vec<i16>,
     search_mode: SearchMode,
     nodes_base: *const u8,
     node_count: usize,
@@ -42,7 +48,12 @@ pub struct SpecialistIndex {
     vectors_len: usize,
     labels: *const u8,
     labels_len: usize,
+    ref_indices: *const u32,
+    ref_indices_len: usize,
+    node_class_bits: *const u8,
+    node_class_bits_len: usize,
     early_exit_threshold: std::sync::atomic::AtomicI64,
+    label_defer: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,13 +73,13 @@ pub struct SearchStats {
     pub blocks_scanned: u32,
 }
 
-/// Bitset over partition keys (0..256) for Modo B routing.
+/// Bitset over partition keys (0..1024) for Modo B routing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PartitionSet(pub [u64; 4]);
+pub struct PartitionSet(pub [u64; 16]);
 
 impl PartitionSet {
     pub const fn empty() -> Self {
-        Self([0; 4])
+        Self([0; 16])
     }
 
     #[inline]
@@ -100,9 +111,13 @@ impl PartitionSet {
 
     /// Union `query_key` with single-bit neighbors (optional route margin).
     pub fn with_query_margin(&self, query_key: u32) -> Self {
+        self.with_query_margin_bits(query_key, 9)
+    }
+
+    pub fn with_query_margin_bits(&self, query_key: u32, key_bits: usize) -> Self {
         let mut s = *self;
         s.set(query_key);
-        for bit in 0..8 {
+        for bit in 0..key_bits.min(10) {
             s.set(query_key ^ (1u32 << bit));
         }
         s
@@ -194,16 +209,18 @@ impl SpecialistIndex {
             return Err("file too short".to_string());
         }
         let magic: &[u8; 8] = bytes[..8].try_into().unwrap();
-        if magic != MAGIC_V3 {
+        let format = if magic == MAGIC_V5 {
+            IndexFormat::V5
+        } else {
             return Err(format!(
                 "unsupported index magic: {:?}. Rebuild index with the preprocess binary",
                 magic
             ));
-        }
-        Self::load(mapping)
+        };
+        Self::load(mapping, format)
     }
 
-    fn load(mapping: MmapRegion) -> Result<Self, String> {
+    fn load(mapping: MmapRegion, format: IndexFormat) -> Result<Self, String> {
         let bytes = mapping.as_slice();
         let mut cursor = 8usize;
 
@@ -214,8 +231,11 @@ impl SpecialistIndex {
         let node_count = read_i32(bytes, &mut cursor)? as usize;
         let total_blocks = read_i32(bytes, &mut cursor)? as usize;
 
+        let scheme_id = read_i16(bytes, &mut cursor)?;
+        let scheme_param = read_i16(bytes, &mut cursor)? as usize;
         let amount_cut_count = read_i16(bytes, &mut cursor)? as usize;
         let dow_cut_count = read_i16(bytes, &mut cursor)? as usize;
+        let learned_count = read_i16(bytes, &mut cursor)? as usize;
 
         let mut amount_cuts = vec![0i16; amount_cut_count];
         for slot in &mut amount_cuts {
@@ -226,8 +246,42 @@ impl SpecialistIndex {
         for slot in &mut dow_cuts {
             *slot = read_i16(bytes, &mut cursor)?;
         }
+        let mut cuts = Vec::with_capacity(amount_cuts.len() + dow_cuts.len());
+        cuts.extend_from_slice(&amount_cuts);
+        cuts.extend_from_slice(&dow_cuts);
 
-        let dow_shift = partition_scheme::bit_width(amount_cut_count + 1);
+        let mut learned_predicates = Vec::with_capacity(learned_count);
+        let mut tree_predicates = Vec::with_capacity(learned_count);
+        for _ in 0..learned_count {
+            let dim = read_u8(bytes, &mut cursor)?;
+            let flags = read_u8(bytes, &mut cursor)?;
+            let threshold = read_i16(bytes, &mut cursor)?;
+            if scheme_id == partition_scheme::SCHEME_ID_LEARNED_TREE {
+                let enabled = flags != 0;
+                if enabled && dim as usize >= DIMS {
+                    return Err(format!("invalid tree predicate dimension: {dim}"));
+                }
+                tree_predicates.push(partition_scheme::TreePredicate {
+                    dim,
+                    threshold,
+                    enabled,
+                });
+            } else {
+                if dim as usize >= DIMS {
+                    return Err(format!("invalid learned predicate dimension: {dim}"));
+                }
+                learned_predicates.push(partition_scheme::LearnedPredicate { dim, threshold });
+            }
+        }
+
+        let partition_scheme = partition_scheme::PartitionScheme::from_header(
+            scheme_id,
+            scheme_param,
+            amount_cut_count,
+            dow_cut_count,
+            learned_predicates,
+            tree_predicates,
+        )?;
 
         if scale != SCALE as i32 {
             return Err(format!(
@@ -283,12 +337,34 @@ impl SpecialistIndex {
             return Err("truncated labels".to_string());
         }
         let labels = unsafe { bytes.as_ptr().add(cursor) };
+        cursor += labels_len;
+
+        cursor = align_cursor(cursor, mem::align_of::<u32>());
+        let ref_indices_len = total_blocks * LANES;
+        let ref_indices_bytes = ref_indices_len * mem::size_of::<u32>();
+        if cursor % mem::align_of::<u32>() != 0 {
+            return Err("unaligned ref_indices section".to_string());
+        }
+        if cursor + ref_indices_bytes > bytes.len() {
+            return Err("truncated ref indices".to_string());
+        }
+        let ref_indices = unsafe { bytes.as_ptr().add(cursor).cast::<u32>() };
+        cursor += ref_indices_bytes;
+
+        let node_class_bits_len = node_count;
+        if cursor + node_class_bits_len > bytes.len() {
+            return Err("truncated node class bits".to_string());
+        }
+        let node_class_bits = unsafe { bytes.as_ptr().add(cursor) };
 
         let early_exit_threshold_val = std::env::var("RINHA_EARLY_EXIT_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let early_exit_threshold = std::sync::atomic::AtomicI64::new(early_exit_threshold_val);
+        let label_defer = std::env::var("RINHA_LABEL_DEFER")
+            .map(|value| value != "0")
+            .unwrap_or(false);
 
         let search_mode = match std::env::var("RINHA_SEARCH_MODE").as_deref() {
             Ok("exact") => SearchMode::Exact,
@@ -297,14 +373,20 @@ impl SpecialistIndex {
         };
 
         eprintln!(
-            "[RNSPCST3] loaded: {} partitions, {} nodes, {} blocks, avx2=true, mode={:?}, early_exit={}, amount_cuts={:?}, dow_cuts={:?}",
+            "[{:?}] loaded: {} partitions, {} nodes, {} blocks, avx2=true, mode={:?}, early_exit={}, label_defer={}, scheme_id={}, scheme_param={}, amount_cuts={:?}, dow_cuts={:?}, tree_depth={}, tree_predicates={}",
+            format,
             partition_count,
             node_count,
             total_blocks,
             search_mode,
             early_exit_threshold_val,
+            label_defer,
+            scheme_id,
+            scheme_param,
             amount_cuts,
-            dow_cuts
+            dow_cuts,
+            partition_scheme.tree_depth,
+            partition_scheme.tree_predicates.len()
         );
 
         let mut active_keys = Vec::with_capacity(partition_count);
@@ -321,9 +403,8 @@ impl SpecialistIndex {
             partition_count,
             key_to_partition,
             active_keys,
-            amount_cuts,
-            dow_cuts,
-            dow_shift,
+            partition_scheme,
+            cuts,
             search_mode,
             nodes_base,
             node_count,
@@ -331,7 +412,12 @@ impl SpecialistIndex {
             vectors_len,
             labels,
             labels_len,
+            ref_indices,
+            ref_indices_len,
+            node_class_bits,
+            node_class_bits_len,
             early_exit_threshold,
+            label_defer,
         };
         index.advise_hugepages();
         Ok(index)
@@ -339,19 +425,39 @@ impl SpecialistIndex {
 
     #[inline]
     pub fn compute_partition_key(&self, vector: &QueryVector) -> u32 {
-        let amt = partition_scheme::bucket(vector[0], &self.amount_cuts);
-        let dow = partition_scheme::bucket(vector[4], &self.dow_cuts);
-        amt | (dow << self.dow_shift)
+        self.partition_scheme.compute_key(vector, &self.cuts)
+    }
+
+    pub fn partition_key_bits(&self) -> usize {
+        self.partition_scheme.key_bits()
     }
 
     pub fn predict_fraud_count(&self, query: &QueryVector) -> u8 {
         let mut best_dists = [i64::MAX; K];
         let mut best_labels = [0u8; K];
+        let mut best_indices = [u32::MAX; K];
+        let mut pending_subtrees = PendingSubtrees::new(self.label_defer);
 
         if self.search_mode == SearchMode::Exact {
             for idx in 0..self.partition_count {
                 let root = unsafe { layout::partition_root(self.partitions_base, idx) };
-                self.search_node_iterative_fast(root, 0, query, &mut best_dists, &mut best_labels);
+                self.search_node_iterative_fast(
+                    root,
+                    0,
+                    query,
+                    &mut best_dists,
+                    &mut best_labels,
+                    &mut best_indices,
+                    Some(&mut pending_subtrees),
+                );
+                replay_pending_if_needed(
+                    self,
+                    query,
+                    &mut best_dists,
+                    &mut best_labels,
+                    &mut best_indices,
+                    &mut pending_subtrees,
+                );
             }
             return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
         }
@@ -376,6 +482,16 @@ impl SpecialistIndex {
                     query,
                     &mut best_dists,
                     &mut best_labels,
+                    &mut best_indices,
+                    Some(&mut pending_subtrees),
+                );
+                replay_pending_if_needed(
+                    self,
+                    query,
+                    &mut best_dists,
+                    &mut best_labels,
+                    &mut best_indices,
+                    &mut pending_subtrees,
                 );
                 if eet > 0 && best_dists[K - 1] < eet {
                     return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
@@ -425,6 +541,16 @@ impl SpecialistIndex {
                 query,
                 &mut best_dists,
                 &mut best_labels,
+                &mut best_indices,
+                Some(&mut pending_subtrees),
+            );
+            replay_pending_if_needed(
+                self,
+                query,
+                &mut best_dists,
+                &mut best_labels,
+                &mut best_indices,
+                &mut pending_subtrees,
             );
             if eet > 0 && best_dists[K - 1] < eet {
                 break;
@@ -441,6 +567,8 @@ impl SpecialistIndex {
         query: &QueryVector,
         best_dists: &mut [i64; K],
         best_labels: &mut [u8; K],
+        best_indices: &mut [u32; K],
+        mut pending_subtrees: Option<&mut PendingSubtrees>,
     ) {
         let mut stack_nodes = [0usize; TREE_STACK_CAPACITY];
         let mut stack_bounds = [0i64; TREE_STACK_CAPACITY];
@@ -451,10 +579,21 @@ impl SpecialistIndex {
 
         loop {
             if current_bound <= best_dists[K - 1] {
+                if let Some(pending) = pending_subtrees.as_deref_mut()
+                    && pending.try_defer(self, current, current_bound, best_dists, best_labels)
+                {
+                    if stack_len == 0 {
+                        break;
+                    }
+                    stack_len -= 1;
+                    current = stack_nodes[stack_len];
+                    current_bound = stack_bounds[stack_len];
+                    continue;
+                }
                 let left = unsafe { layout::node_left(self.nodes_base, current) };
                 let right = unsafe { layout::node_right(self.nodes_base, current) };
                 if left < 0 || right < 0 {
-                    self.scan_leaf_fast(current, query, best_dists, best_labels);
+                    self.scan_leaf_fast(current, query, best_dists, best_labels, best_indices);
                 } else {
                     let l = left as usize;
                     let r = right as usize;
@@ -515,12 +654,15 @@ impl SpecialistIndex {
         query: &QueryVector,
         best_dists: &mut [i64; K],
         best_labels: &mut [u8; K],
+        best_indices: &mut [u32; K],
     ) {
         let start_block = unsafe { layout::node_start(self.nodes_base, node_idx) };
         let node_len = unsafe { layout::node_len(self.nodes_base, node_idx) };
         let blocks = (node_len + LANES - 1) / LANES;
         let vectors = self.vectors();
         let labels = self.labels();
+        let ref_indices = self.ref_indices();
+        let q_pairs = unsafe { query_pairs_avx2(query) };
 
         for b in 0..blocks {
             let block_idx = start_block + b;
@@ -542,12 +684,26 @@ impl SpecialistIndex {
                 }
             }
 
-            let dists =
-                unsafe { scan_block_avx2_bounded(vectors, block_base, query, best_dists[K - 1]) };
+            let (mask, dists) = unsafe {
+                scan_block_pair_avx2_bounded(vectors, block_base, &q_pairs, best_dists[K - 1])
+            };
+            if mask == 0 {
+                continue;
+            }
             let labels_base = block_idx * LANES;
             let lane_count = (node_len - b * LANES).min(LANES);
-            for i in 0..lane_count {
-                insert_best_fast(dists[i], labels[labels_base + i], best_dists, best_labels);
+            let mut mask = mask & ((1u32 << lane_count) - 1);
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                insert_best_fast(
+                    dists[i] as i64,
+                    labels[labels_base + i],
+                    ref_indices[labels_base + i],
+                    best_dists,
+                    best_labels,
+                    best_indices,
+                );
             }
         }
     }
@@ -646,6 +802,7 @@ impl SpecialistIndex {
     ) -> u8 {
         let mut best_dists = [i64::MAX; K];
         let mut best_labels = [0u8; K];
+        let mut best_indices = [u32::MAX; K];
         if let Some(keys) = track_part_keys.as_mut() {
             keys.fill(u32::MAX);
         }
@@ -665,6 +822,7 @@ impl SpecialistIndex {
                     part_key,
                     &mut best_dists,
                     &mut best_labels,
+                    &mut best_indices,
                     &mut stats,
                     &mut track_part_keys,
                 );
@@ -701,6 +859,7 @@ impl SpecialistIndex {
                         part_key,
                         &mut best_dists,
                         &mut best_labels,
+                        &mut best_indices,
                         &mut stats,
                         &mut track_part_keys,
                     );
@@ -768,6 +927,7 @@ impl SpecialistIndex {
                 part_key,
                 &mut best_dists,
                 &mut best_labels,
+                &mut best_indices,
                 &mut stats,
                 &mut track_part_keys,
             );
@@ -809,6 +969,7 @@ impl SpecialistIndex {
         partition_key: u32,
         best_dists: &mut [i64; K],
         best_labels: &mut [u8; K],
+        best_indices: &mut [u32; K],
         stats: &mut Option<&mut SearchStats>,
         track_part_keys: &mut Option<&mut [u32; K]>,
     ) {
@@ -837,6 +998,7 @@ impl SpecialistIndex {
                         partition_key,
                         best_dists,
                         best_labels,
+                        best_indices,
                         stats,
                         track_part_keys,
                     );
@@ -901,6 +1063,7 @@ impl SpecialistIndex {
         partition_key: u32,
         best_dists: &mut [i64; K],
         best_labels: &mut [u8; K],
+        best_indices: &mut [u32; K],
         stats: &mut Option<&mut SearchStats>,
         track_part_keys: &mut Option<&mut [u32; K]>,
     ) {
@@ -913,6 +1076,8 @@ impl SpecialistIndex {
         }
         let vectors = self.vectors();
         let labels = self.labels();
+        let ref_indices = self.ref_indices();
+        let q_pairs = unsafe { query_pairs_avx2(query) };
         debug_assert!(
             start_block + blocks <= self.vectors_len / (DIMS * LANES),
             "scan_leaf OOB: start_block={}, blocks={}, total_blocks={}",
@@ -941,17 +1106,26 @@ impl SpecialistIndex {
                 }
             }
 
-            let dists =
-                unsafe { scan_block_avx2_bounded(vectors, block_base, query, best_dists[K - 1]) };
+            let (mask, dists) = unsafe {
+                scan_block_pair_avx2_bounded(vectors, block_base, &q_pairs, best_dists[K - 1])
+            };
+            if mask == 0 {
+                continue;
+            }
             let labels_base = block_idx * LANES;
             let lane_count = (node_len - b * LANES).min(LANES);
-            for i in 0..lane_count {
+            let mut mask = mask & ((1u32 << lane_count) - 1);
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
                 insert_best(
-                    dists[i],
+                    dists[i] as i64,
                     labels[labels_base + i],
+                    ref_indices[labels_base + i],
                     partition_key,
                     best_dists,
                     best_labels,
+                    best_indices,
                     track_part_keys,
                 );
             }
@@ -966,6 +1140,16 @@ impl SpecialistIndex {
         unsafe { slice::from_raw_parts(self.labels, self.labels_len) }
     }
 
+    fn ref_indices(&self) -> &[u32] {
+        unsafe { slice::from_raw_parts(self.ref_indices, self.ref_indices_len) }
+    }
+
+    #[inline(always)]
+    fn node_class_bits(&self, node_idx: usize) -> u8 {
+        debug_assert!(node_idx < self.node_class_bits_len);
+        unsafe { *self.node_class_bits.add(node_idx) }
+    }
+
     fn advise_hugepages(&self) {
         #[cfg(target_os = "linux")]
         unsafe {
@@ -976,7 +1160,118 @@ impl SpecialistIndex {
             let lptr = self.labels as *mut libc::c_void;
             let llen = self.labels_len;
             libc::madvise(lptr, llen, libc::MADV_HUGEPAGE);
+
+            let rptr = self.ref_indices as *mut libc::c_void;
+            let rlen = self.ref_indices_len * mem::size_of::<u32>();
+            libc::madvise(rptr, rlen, libc::MADV_HUGEPAGE);
         }
+    }
+}
+
+struct PendingSubtrees {
+    enabled: bool,
+    label: Option<u8>,
+    roots: [usize; DEFER_STACK_CAPACITY],
+    bounds: [i64; DEFER_STACK_CAPACITY],
+    len: usize,
+}
+
+impl PendingSubtrees {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            label: None,
+            roots: [0; DEFER_STACK_CAPACITY],
+            bounds: [0; DEFER_STACK_CAPACITY],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn try_defer(
+        &mut self,
+        index: &SpecialistIndex,
+        node_idx: usize,
+        bound: i64,
+        best_dists: &[i64; K],
+        best_labels: &[u8; K],
+    ) -> bool {
+        if !self.enabled || self.len >= DEFER_STACK_CAPACITY {
+            return false;
+        }
+        let Some(label) = consensus_label(best_dists, best_labels) else {
+            return false;
+        };
+        let needed = 1u8 << (1 - label);
+        let class_bits = index.node_class_bits(node_idx);
+        if class_bits == 0 || (class_bits & needed) != 0 {
+            return false;
+        }
+        self.label.get_or_insert(label);
+        if self.label != Some(label) {
+            return false;
+        }
+        self.roots[self.len] = node_idx;
+        self.bounds[self.len] = bound;
+        self.len += 1;
+        true
+    }
+
+    #[inline(always)]
+    fn should_replay(&self, best_dists: &[i64; K], best_labels: &[u8; K]) -> bool {
+        self.len > 0 && consensus_label(best_dists, best_labels) != self.label
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<(usize, i64)> {
+        if self.len == 0 {
+            self.label = None;
+            return None;
+        }
+        self.len -= 1;
+        Some((self.roots[self.len], self.bounds[self.len]))
+    }
+}
+
+#[inline(always)]
+fn consensus_label(best_dists: &[i64; K], best_labels: &[u8; K]) -> Option<u8> {
+    if best_dists[K - 1] == i64::MAX {
+        return None;
+    }
+    let sum = best_labels.iter().map(|&label| label as u32).sum::<u32>();
+    if sum == 0 {
+        Some(0)
+    } else if sum == K as u32 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn replay_pending_if_needed(
+    index: &SpecialistIndex,
+    query: &QueryVector,
+    best_dists: &mut [i64; K],
+    best_labels: &mut [u8; K],
+    best_indices: &mut [u32; K],
+    pending_subtrees: &mut PendingSubtrees,
+) {
+    if !pending_subtrees.should_replay(best_dists, best_labels) {
+        return;
+    }
+    while let Some((root, bound)) = pending_subtrees.pop() {
+        if bound > best_dists[K - 1] {
+            continue;
+        }
+        index.search_node_iterative_fast(
+            root,
+            bound,
+            query,
+            best_dists,
+            best_labels,
+            best_indices,
+            None,
+        );
     }
 }
 
@@ -1003,18 +1298,21 @@ fn sort_partition_entries(entries: &mut [(i64, usize)]) {
 fn insert_best(
     dist: i64,
     label: u8,
+    ref_index: u32,
     partition_key: u32,
     best_dists: &mut [i64; K],
     best_labels: &mut [u8; K],
+    best_indices: &mut [u32; K],
     track_part_keys: &mut Option<&mut [u32; K]>,
 ) {
-    if dist >= best_dists[K - 1] {
+    if !candidate_before(dist, ref_index, best_dists[K - 1], best_indices[K - 1]) {
         return;
     }
     let mut pos = K - 1;
-    while pos > 0 && dist < best_dists[pos - 1] {
+    while pos > 0 && candidate_before(dist, ref_index, best_dists[pos - 1], best_indices[pos - 1]) {
         best_dists[pos] = best_dists[pos - 1];
         best_labels[pos] = best_labels[pos - 1];
+        best_indices[pos] = best_indices[pos - 1];
         if let Some(keys) = track_part_keys.as_deref_mut() {
             keys[pos] = keys[pos - 1];
         }
@@ -1022,91 +1320,84 @@ fn insert_best(
     }
     best_dists[pos] = dist;
     best_labels[pos] = label;
+    best_indices[pos] = ref_index;
     if let Some(keys) = track_part_keys.as_deref_mut() {
         keys[pos] = partition_key;
     }
 }
 
 #[inline(always)]
-fn insert_best_fast(dist: i64, label: u8, best_dists: &mut [i64; K], best_labels: &mut [u8; K]) {
-    if dist >= best_dists[K - 1] {
+fn insert_best_fast(
+    dist: i64,
+    label: u8,
+    ref_index: u32,
+    best_dists: &mut [i64; K],
+    best_labels: &mut [u8; K],
+    best_indices: &mut [u32; K],
+) {
+    if !candidate_before(dist, ref_index, best_dists[K - 1], best_indices[K - 1]) {
         return;
     }
     let mut pos = K - 1;
-    while pos > 0 && dist < best_dists[pos - 1] {
+    while pos > 0 && candidate_before(dist, ref_index, best_dists[pos - 1], best_indices[pos - 1]) {
         best_dists[pos] = best_dists[pos - 1];
         best_labels[pos] = best_labels[pos - 1];
+        best_indices[pos] = best_indices[pos - 1];
         pos -= 1;
     }
     best_dists[pos] = dist;
     best_labels[pos] = label;
+    best_indices[pos] = ref_index;
+}
+
+#[inline(always)]
+fn candidate_before(dist: i64, ref_index: u32, other_dist: i64, other_index: u32) -> bool {
+    dist < other_dist || (dist == other_dist && ref_index < other_index)
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn scan_block_avx2_bounded(
+unsafe fn query_pairs_avx2(query: &QueryVector) -> [std::arch::x86_64::__m256i; DIM_PAIRS] {
+    use std::arch::x86_64::*;
+    let mut q_pairs = [_mm256_setzero_si256(); DIM_PAIRS];
+    for pair in 0..DIM_PAIRS {
+        let lo = query[pair * 2] as u16 as u32;
+        let hi = query[pair * 2 + 1] as u16 as u32;
+        q_pairs[pair] = _mm256_set1_epi32((lo | (hi << 16)) as i32);
+    }
+    q_pairs
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn scan_block_pair_avx2_bounded(
     vectors: &[i16],
     block_base: usize,
-    query: &QueryVector,
+    q_pairs: &[std::arch::x86_64::__m256i; DIM_PAIRS],
     limit: i64,
-) -> [i64; LANES] {
+) -> (u32, [i32; LANES]) {
     use std::arch::x86_64::*;
     unsafe {
-        let mut sum64_lo = _mm256_setzero_si256();
-        let mut sum64_hi = _mm256_setzero_si256();
-        let mut sum32_lo = _mm_setzero_si128();
-        let mut sum32_hi = _mm_setzero_si128();
-
-        for d in (0..DIMS).step_by(2) {
-            let q_d = _mm_set1_epi16(query[d]);
-            let q_d1 = _mm_set1_epi16(query[d + 1]);
-
-            let v_ptr_d = vectors.as_ptr().add(block_base + d * LANES);
-            let v_ptr_d1 = vectors.as_ptr().add(block_base + (d + 1) * LANES);
-
-            let v_d = _mm_loadu_si128(v_ptr_d as *const __m128i);
-            let v_d1 = _mm_loadu_si128(v_ptr_d1 as *const __m128i);
-
-            let diff_d = _mm_sub_epi16(q_d, v_d);
-            let diff_d1 = _mm_sub_epi16(q_d1, v_d1);
-
-            let lo = _mm_unpacklo_epi16(diff_d, diff_d1);
-            let hi = _mm_unpackhi_epi16(diff_d, diff_d1);
-
-            sum32_lo = _mm_add_epi32(sum32_lo, _mm_madd_epi16(lo, lo));
-            sum32_hi = _mm_add_epi32(sum32_hi, _mm_madd_epi16(hi, hi));
-
-            if (d + 2) % 4 == 0 {
-                sum64_lo = _mm256_add_epi64(sum64_lo, _mm256_cvtepi32_epi64(sum32_lo));
-                sum64_hi = _mm256_add_epi64(sum64_hi, _mm256_cvtepi32_epi64(sum32_hi));
-                if all_lanes_at_least(sum64_lo, sum64_hi, limit) {
-                    return [limit; LANES];
-                }
-                sum32_lo = _mm_setzero_si128();
-                sum32_hi = _mm_setzero_si128();
-            }
+        let base = vectors.as_ptr().add(block_base);
+        let mut acc = _mm256_setzero_si256();
+        for pair in 0..DIM_PAIRS {
+            let packed = _mm256_loadu_si256(base.add(pair * LANES * 2) as *const __m256i);
+            let diff = _mm256_sub_epi16(q_pairs[pair], packed);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff, diff));
         }
 
-        sum64_lo = _mm256_add_epi64(sum64_lo, _mm256_cvtepi32_epi64(sum32_lo));
-        sum64_hi = _mm256_add_epi64(sum64_hi, _mm256_cvtepi32_epi64(sum32_hi));
-
-        let mut block_dists = [0i64; LANES];
-        _mm256_storeu_si256(block_dists.as_mut_ptr() as *mut __m256i, sum64_lo);
-        _mm256_storeu_si256(block_dists.as_mut_ptr().add(4) as *mut __m256i, sum64_hi);
-        block_dists
+        let mut block_dists = [0i32; LANES];
+        if limit < i32::MAX as i64 {
+            let below = _mm256_cmpgt_epi32(_mm256_set1_epi32(limit as i32 + 1), acc);
+            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(below)) as u32;
+            if mask == 0 {
+                return (0, block_dists);
+            }
+            _mm256_storeu_si256(block_dists.as_mut_ptr() as *mut __m256i, acc);
+            (mask, block_dists)
+        } else {
+            _mm256_storeu_si256(block_dists.as_mut_ptr() as *mut __m256i, acc);
+            (0xff, block_dists)
+        }
     }
-}
-
-#[target_feature(enable = "avx2")]
-unsafe fn all_lanes_at_least(
-    lo: std::arch::x86_64::__m256i,
-    hi: std::arch::x86_64::__m256i,
-    limit: i64,
-) -> bool {
-    use std::arch::x86_64::*;
-    let lim = _mm256_set1_epi64x(limit);
-    let below_lo = _mm256_cmpgt_epi64(lim, lo);
-    let below_hi = _mm256_cmpgt_epi64(lim, hi);
-    (_mm256_movemask_epi8(below_lo) | _mm256_movemask_epi8(below_hi)) == 0
 }
 
 #[inline(always)]
@@ -1159,4 +1450,17 @@ fn read_i16(bytes: &[u8], cursor: &mut usize) -> Result<i16, String> {
     let v = i16::from_le_bytes(bytes[*cursor..*cursor + 2].try_into().unwrap());
     *cursor += 2;
     Ok(v)
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    if *cursor + 1 > bytes.len() {
+        return Err("unexpected EOF (u8)".to_string());
+    }
+    let v = bytes[*cursor];
+    *cursor += 1;
+    Ok(v)
+}
+
+fn align_cursor(cursor: usize, align: usize) -> usize {
+    cursor + ((align - (cursor % align)) % align)
 }
