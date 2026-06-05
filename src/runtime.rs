@@ -12,17 +12,6 @@ pub fn payload_warmup_requests() -> usize {
         .unwrap_or(256)
 }
 
-pub fn socket_warmup_enabled() -> bool {
-    std::env::var("RINHA_SOCKET_WARMUP").as_deref() == Ok("1")
-}
-
-pub fn socket_warmup_requests() -> usize {
-    std::env::var("RINHA_SOCKET_WARMUP_REQUESTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
-}
-
 pub fn self_warmup_enabled() -> bool {
     std::env::var("RINHA_SELF_WARMUP").as_deref() == Ok("1")
 }

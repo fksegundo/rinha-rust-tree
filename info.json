@@ -6,9 +6,6 @@
     ],
     "source-code-repo": "https://github.com/fksegundo/rinha-rust-tree",
     "stack": [
-        ".net",
-        "c#",
-        "python",
         "rust"
     ]
 }

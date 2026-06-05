@@ -2,7 +2,7 @@ FROM rust:bookworm AS build
 
 ARG RUST_TARGET_CPU=haswell
 ARG RINHA_NATIVE_SCALE=10000
-ARG RINHA_CARGO_FEATURES=
+#ARG RINHA_CARGO_FEATURES=
 ENV RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU} -C target-feature=+avx2 -C panic=abort -C link-arg=-Wl,--gc-sections"
 ENV RINHA_NATIVE_SCALE=${RINHA_NATIVE_SCALE}
 
@@ -41,10 +41,7 @@ COPY --from=preprocess /app/index/rinha-specialist.idx /app/index/rinha-speciali
 COPY resources/ ./resources/
 
 ENV RINHA_INDEX_PATH=/app/index/rinha-specialist.idx
-ENV BIND_ADDR=0.0.0.0:8080
-ENV RINHA_SEARCH_MODE=key-first
 
-ENV RINHA_FD_EVENTED=1
 ENV RINHA_CLIENT_FD_PRECONFIGURED=1
 ENV RINHA_BUF_POOL_INIT=512
 ENV RINHA_EPOLL_IDLE_US=60

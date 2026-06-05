@@ -100,7 +100,6 @@ pub fn build_index(
     let split_strategy = kd_split_strategy();
 
     scheme.prepare(&references);
-    let cuts = scheme.compute_cuts(&references);
     eprintln!(
         "[build] scheme={} scheme_id={} tree_depth={} (persisted in header), kd_split={:?}",
         scheme.name,
@@ -114,16 +113,12 @@ pub fn build_index(
         references.len() as i32,
         scheme.scheme_id(),
         scheme.tree_depth as i16,
-        0,
-        0,
-        &cuts,
-        &[],
         &scheme.tree_predicates,
     )?;
 
     let mut partitions: HashMap<u32, Vec<usize>> = HashMap::new();
     for (idx, ref_item) in references.iter().enumerate() {
-        let key = scheme.compute_key(&ref_item.vector, &cuts);
+        let key = scheme.compute_key(&ref_item.vector);
         partitions.entry(key).or_default().push(idx);
     }
 

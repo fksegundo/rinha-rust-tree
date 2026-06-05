@@ -3,13 +3,6 @@ pub mod format;
 mod layout;
 pub mod partition_scheme;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchMode {
-    Exact,
-    Specialist,
-    KeyFirst,
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -40,8 +33,6 @@ pub struct SpecialistIndex {
     key_to_partition: [i32; KEY_LOOKUP_SIZE],
     active_keys: Vec<u32>,
     partition_scheme: partition_scheme::PartitionScheme,
-    cuts: Vec<i16>,
-    search_mode: SearchMode,
     nodes_base: *const u8,
     node_count: usize,
     vectors: *const i16,
@@ -105,20 +96,6 @@ impl PartitionSet {
             if k < KEY_LOOKUP_SIZE as u32 {
                 s.set(k);
             }
-        }
-        s
-    }
-
-    /// Union `query_key` with single-bit neighbors (optional route margin).
-    pub fn with_query_margin(&self, query_key: u32) -> Self {
-        self.with_query_margin_bits(query_key, 9)
-    }
-
-    pub fn with_query_margin_bits(&self, query_key: u32, key_bits: usize) -> Self {
-        let mut s = *self;
-        s.set(query_key);
-        for bit in 0..key_bits.min(10) {
-            s.set(query_key ^ (1u32 << bit));
         }
         s
     }
@@ -235,51 +212,33 @@ impl SpecialistIndex {
         let scheme_param = read_i16(bytes, &mut cursor)? as usize;
         let amount_cut_count = read_i16(bytes, &mut cursor)? as usize;
         let dow_cut_count = read_i16(bytes, &mut cursor)? as usize;
-        let learned_count = read_i16(bytes, &mut cursor)? as usize;
+        let predicate_count = read_i16(bytes, &mut cursor)? as usize;
 
-        let mut amount_cuts = vec![0i16; amount_cut_count];
-        for slot in &mut amount_cuts {
-            *slot = read_i16(bytes, &mut cursor)?;
+        // Legacy cuts: now always 0, but we still skip the bytes to keep the
+        // header offsets stable.
+        for _ in 0..(amount_cut_count + dow_cut_count) {
+            read_i16(bytes, &mut cursor)?;
         }
 
-        let mut dow_cuts = vec![0i16; dow_cut_count];
-        for slot in &mut dow_cuts {
-            *slot = read_i16(bytes, &mut cursor)?;
-        }
-        let mut cuts = Vec::with_capacity(amount_cuts.len() + dow_cuts.len());
-        cuts.extend_from_slice(&amount_cuts);
-        cuts.extend_from_slice(&dow_cuts);
-
-        let mut learned_predicates = Vec::with_capacity(learned_count);
-        let mut tree_predicates = Vec::with_capacity(learned_count);
-        for _ in 0..learned_count {
+        let mut tree_predicates = Vec::with_capacity(predicate_count);
+        for _ in 0..predicate_count {
             let dim = read_u8(bytes, &mut cursor)?;
             let flags = read_u8(bytes, &mut cursor)?;
             let threshold = read_i16(bytes, &mut cursor)?;
-            if scheme_id == partition_scheme::SCHEME_ID_LEARNED_TREE {
-                let enabled = flags != 0;
-                if enabled && dim as usize >= DIMS {
-                    return Err(format!("invalid tree predicate dimension: {dim}"));
-                }
-                tree_predicates.push(partition_scheme::TreePredicate {
-                    dim,
-                    threshold,
-                    enabled,
-                });
-            } else {
-                if dim as usize >= DIMS {
-                    return Err(format!("invalid learned predicate dimension: {dim}"));
-                }
-                learned_predicates.push(partition_scheme::LearnedPredicate { dim, threshold });
+            let enabled = flags != 0;
+            if enabled && dim as usize >= DIMS {
+                return Err(format!("invalid tree predicate dimension: {dim}"));
             }
+            tree_predicates.push(partition_scheme::TreePredicate {
+                dim,
+                threshold,
+                enabled,
+            });
         }
 
         let partition_scheme = partition_scheme::PartitionScheme::from_header(
             scheme_id,
             scheme_param,
-            amount_cut_count,
-            dow_cut_count,
-            learned_predicates,
             tree_predicates,
         )?;
 
@@ -366,25 +325,14 @@ impl SpecialistIndex {
             .map(|value| value != "0")
             .unwrap_or(false);
 
-        let search_mode = match std::env::var("RINHA_SEARCH_MODE").as_deref() {
-            Ok("exact") => SearchMode::Exact,
-            Ok("specialist") => SearchMode::Specialist,
-            _ => SearchMode::KeyFirst,
-        };
-
         eprintln!(
-            "[{:?}] loaded: {} partitions, {} nodes, {} blocks, avx2=true, mode={:?}, early_exit={}, label_defer={}, scheme_id={}, scheme_param={}, amount_cuts={:?}, dow_cuts={:?}, tree_depth={}, tree_predicates={}",
+            "[{:?}] loaded: {} partitions, {} nodes, {} blocks, avx2=true, early_exit={}, label_defer={}, tree_depth={}, tree_predicates={}",
             format,
             partition_count,
             node_count,
             total_blocks,
-            search_mode,
             early_exit_threshold_val,
             label_defer,
-            scheme_id,
-            scheme_param,
-            amount_cuts,
-            dow_cuts,
             partition_scheme.tree_depth,
             partition_scheme.tree_predicates.len()
         );
@@ -404,8 +352,6 @@ impl SpecialistIndex {
             key_to_partition,
             active_keys,
             partition_scheme,
-            cuts,
-            search_mode,
             nodes_base,
             node_count,
             vectors,
@@ -425,7 +371,7 @@ impl SpecialistIndex {
 
     #[inline]
     pub fn compute_partition_key(&self, vector: &QueryVector) -> u32 {
-        self.partition_scheme.compute_key(vector, &self.cuts)
+        self.partition_scheme.compute_key(vector)
     }
 
     pub fn partition_key_bits(&self) -> usize {
@@ -438,64 +384,37 @@ impl SpecialistIndex {
         let mut best_indices = [u32::MAX; K];
         let mut pending_subtrees = PendingSubtrees::new(self.label_defer);
 
-        if self.search_mode == SearchMode::Exact {
-            for idx in 0..self.partition_count {
-                let root = unsafe { layout::partition_root(self.partitions_base, idx) };
-                self.search_node_iterative_fast(
-                    root,
-                    0,
-                    query,
-                    &mut best_dists,
-                    &mut best_labels,
-                    &mut best_indices,
-                    Some(&mut pending_subtrees),
-                );
-                replay_pending_if_needed(
-                    self,
-                    query,
-                    &mut best_dists,
-                    &mut best_labels,
-                    &mut best_indices,
-                    &mut pending_subtrees,
-                );
-            }
-            return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
-        }
-
         let query_key = self.compute_partition_key(query);
         let eet = self
             .early_exit_threshold
             .load(std::sync::atomic::Ordering::Relaxed);
-        let exact_partition_idx = self.partition_idx_for_key(query_key);
 
-        if self.search_mode == SearchMode::KeyFirst {
-            if let Some(idx) = exact_partition_idx {
-                let root = unsafe { layout::partition_root(self.partitions_base, idx) };
-                let bound = lower_bound_box(
-                    query,
-                    unsafe { layout::partition_min(self.partitions_base, idx) },
-                    unsafe { layout::partition_max(self.partitions_base, idx) },
-                );
-                self.search_node_iterative_fast(
-                    root,
-                    bound,
-                    query,
-                    &mut best_dists,
-                    &mut best_labels,
-                    &mut best_indices,
-                    Some(&mut pending_subtrees),
-                );
-                replay_pending_if_needed(
-                    self,
-                    query,
-                    &mut best_dists,
-                    &mut best_labels,
-                    &mut best_indices,
-                    &mut pending_subtrees,
-                );
-                if eet > 0 && best_dists[K - 1] < eet {
-                    return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
-                }
+        if let Some(idx) = self.partition_idx_for_key(query_key) {
+            let root = unsafe { layout::partition_root(self.partitions_base, idx) };
+            let bound = lower_bound_box(
+                query,
+                unsafe { layout::partition_min(self.partitions_base, idx) },
+                unsafe { layout::partition_max(self.partitions_base, idx) },
+            );
+            self.search_node_iterative_fast(
+                root,
+                bound,
+                query,
+                &mut best_dists,
+                &mut best_labels,
+                &mut best_indices,
+                Some(&mut pending_subtrees),
+            );
+            replay_pending_if_needed(
+                self,
+                query,
+                &mut best_dists,
+                &mut best_labels,
+                &mut best_indices,
+                &mut pending_subtrees,
+            );
+            if eet > 0 && best_dists[K - 1] < eet {
+                return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
             }
         }
 
@@ -505,7 +424,7 @@ impl SpecialistIndex {
         let mut partition_len = 0usize;
 
         for &key in &self.active_keys {
-            if self.search_mode == SearchMode::KeyFirst && key == query_key {
+            if key == query_key {
                 continue;
             }
             let idx = self.key_to_partition[key as usize] as usize;
@@ -731,16 +650,6 @@ impl SpecialistIndex {
         self.predict_fraud_count_inner(query, None, Some(allowed), None)
     }
 
-    pub fn predict_fraud_count_in_partitions_with_stats(
-        &self,
-        query: &QueryVector,
-        allowed: &PartitionSet,
-    ) -> (u8, SearchStats) {
-        let mut stats = SearchStats::default();
-        let count = self.predict_fraud_count_inner(query, Some(&mut stats), Some(allowed), None);
-        (count, stats)
-    }
-
     pub fn metadata(&self) -> IndexMetadata {
         IndexMetadata {
             reference_count: self.reference_count,
@@ -807,29 +716,6 @@ impl SpecialistIndex {
             keys.fill(u32::MAX);
         }
 
-        // Exact Mode
-        if self.search_mode == SearchMode::Exact {
-            for idx in 0..self.partition_count {
-                let part_key = unsafe { layout::partition_key(self.partitions_base, idx) };
-                if !self.partition_search_allowed(part_key, allowed) {
-                    continue;
-                }
-                let root = unsafe { layout::partition_root(self.partitions_base, idx) };
-                self.search_node_iterative(
-                    root,
-                    0, // no pruning
-                    query,
-                    part_key,
-                    &mut best_dists,
-                    &mut best_labels,
-                    &mut best_indices,
-                    &mut stats,
-                    &mut track_part_keys,
-                );
-            }
-            return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
-        }
-
         let query_key = self.compute_partition_key(query);
         // Restricted search must be exact (no early exit).
         let eet = if allowed.is_some() {
@@ -839,38 +725,32 @@ impl SpecialistIndex {
                 .load(std::sync::atomic::Ordering::Relaxed)
         };
 
-        let exact_partition_idx = self.partition_idx_for_key(query_key);
-
-        // KeyFirst Search Mode (runs exact query key partition first)
-        if self.search_mode == SearchMode::KeyFirst {
-            if let Some(idx) = exact_partition_idx {
-                let part_key = unsafe { layout::partition_key(self.partitions_base, idx) };
-                if self.partition_search_allowed(part_key, allowed) {
-                    let root = unsafe { layout::partition_root(self.partitions_base, idx) };
-                    let bound = lower_bound_box(
-                        query,
-                        unsafe { layout::partition_min(self.partitions_base, idx) },
-                        unsafe { layout::partition_max(self.partitions_base, idx) },
-                    );
-                    self.search_node_iterative(
-                        root,
-                        bound,
-                        query,
-                        part_key,
-                        &mut best_dists,
-                        &mut best_labels,
-                        &mut best_indices,
-                        &mut stats,
-                        &mut track_part_keys,
-                    );
-                    if eet > 0 && best_dists[K - 1] < eet {
-                        return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
-                    }
+        if let Some(idx) = self.partition_idx_for_key(query_key) {
+            let part_key = unsafe { layout::partition_key(self.partitions_base, idx) };
+            if self.partition_search_allowed(part_key, allowed) {
+                let root = unsafe { layout::partition_root(self.partitions_base, idx) };
+                let bound = lower_bound_box(
+                    query,
+                    unsafe { layout::partition_min(self.partitions_base, idx) },
+                    unsafe { layout::partition_max(self.partitions_base, idx) },
+                );
+                self.search_node_iterative(
+                    root,
+                    bound,
+                    query,
+                    part_key,
+                    &mut best_dists,
+                    &mut best_labels,
+                    &mut best_indices,
+                    &mut stats,
+                    &mut track_part_keys,
+                );
+                if eet > 0 && best_dists[K - 1] < eet {
+                    return best_labels.iter().map(|&l| l as u32).sum::<u32>() as u8;
                 }
             }
         }
 
-        // Dynamic partition sorting and sweep for both KeyFirst (remaining partitions) and Specialist (all partitions)
         let mut partition_entries: MaybeUninit<[(i64, usize); MAX_PARTITIONS]> =
             MaybeUninit::uninit();
         let partition_entries_ptr = partition_entries.as_mut_ptr();
@@ -886,7 +766,7 @@ impl SpecialistIndex {
         };
 
         for &key in candidate_keys {
-            if self.search_mode == SearchMode::KeyFirst && key == query_key {
+            if key == query_key {
                 continue;
             }
             let idx = self.key_to_partition[key as usize] as usize;

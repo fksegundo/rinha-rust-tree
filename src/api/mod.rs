@@ -12,11 +12,7 @@ use std::time::{Duration, Instant};
 
 static ACCEPT_WARMUP: AtomicBool = AtomicBool::new(false);
 
-pub fn run(index_path: &str, _bind_addr: &str, fd_socket: Option<&str>) {
-    if std::env::var("RINHA_MLOCK_ALL").as_deref() == Ok("1") {
-        mlock_current_and_future();
-    }
-
+pub fn run(index_path: &str, fd_socket: Option<&str>) {
     let index = Arc::new(
         SpecialistIndex::open(index_path)
             .unwrap_or_else(|e| panic!("failed to open index '{}': {}", index_path, e)),
@@ -42,12 +38,6 @@ pub fn run(index_path: &str, _bind_addr: &str, fd_socket: Option<&str>) {
     );
     warm_up_payload_path(&index);
 
-    if let Ok(train_json) = std::env::var("RINHA_PGO_TRAIN_JSON") {
-        pgo_train(&index, &train_json);
-        eprintln!("pgo training complete, exiting cleanly to flush profile");
-        return;
-    }
-
     let api_socket_prefix = std::env::var("API_SOCKET_PREFIX").ok().or_else(|| {
         if std::path::Path::new("/sockets").is_dir() {
             let hostname = std::env::var("HOSTNAME").unwrap_or_default();
@@ -63,13 +53,7 @@ pub fn run(index_path: &str, _bind_addr: &str, fd_socket: Option<&str>) {
 
     if let Some(prefix) = api_socket_prefix {
         if runtime::self_warmup_enabled() {
-            eprintln!(
-                "self HTTP warmup enabled (url={} duration={}ms concurrency={} payloads={})",
-                runtime::self_warmup_url(),
-                runtime::self_warmup_duration_ms(),
-                runtime::self_warmup_concurrency(),
-                runtime::self_warmup_payloads_path()
-            );
+            log_self_warmup_config();
             ACCEPT_WARMUP.store(true, Ordering::Release);
             eprintln!(
                 "accepting worker sockets at {prefix}.sock (defer /ready until self HTTP warmup)"
@@ -83,32 +67,28 @@ pub fn run(index_path: &str, _bind_addr: &str, fd_socket: Option<&str>) {
         return;
     }
 
-    if let Some(socket_path) = fd_socket {
-        if runtime::self_warmup_enabled() {
-            eprintln!(
-                "self HTTP warmup enabled (url={} duration={}ms concurrency={} payloads={})",
-                runtime::self_warmup_url(),
-                runtime::self_warmup_duration_ms(),
-                runtime::self_warmup_concurrency(),
-                runtime::self_warmup_payloads_path()
-            );
-            ACCEPT_WARMUP.store(true, Ordering::Release);
-            run_fd_mode_evented_with_self_warmup(index, ready, socket_path.to_string());
-        } else if runtime::socket_warmup_enabled() {
-            eprintln!(
-                "socket warmup enabled ({} requests via fd-pass before /ready)",
-                runtime::socket_warmup_requests()
-            );
-            ACCEPT_WARMUP.store(true, Ordering::Release);
-            run_fd_mode_evented_with_socket_warmup(index, ready, socket_path.to_string());
-        } else {
-            ready.store(true, Ordering::Release);
-            eprintln!("warmup complete, accepting connections");
-            run_fd_mode(index, ready, socket_path);
-        }
+    let socket_path =
+        fd_socket.expect("FD-passing socket required: set RINHA_FD_SOCKET or mount /sockets");
+
+    if runtime::self_warmup_enabled() {
+        log_self_warmup_config();
+        ACCEPT_WARMUP.store(true, Ordering::Release);
+        run_fd_mode_evented_with_self_warmup(index, ready, socket_path.to_string());
     } else {
-        panic!("TCP mode is disabled. Please configure Unix sockets for FD-passing.");
+        ready.store(true, Ordering::Release);
+        eprintln!("warmup complete, accepting connections");
+        run_fd_mode(index, ready, socket_path);
     }
+}
+
+fn log_self_warmup_config() {
+    eprintln!(
+        "self HTTP warmup enabled (url={} duration={}ms concurrency={} payloads={})",
+        runtime::self_warmup_url(),
+        runtime::self_warmup_duration_ms(),
+        runtime::self_warmup_concurrency(),
+        runtime::self_warmup_payloads_path()
+    );
 }
 
 fn run_fd_worker_mode(
@@ -168,33 +148,6 @@ fn start_self_warmup_thread(ready: Arc<AtomicBool>) {
     });
 }
 
-fn run_fd_mode_evented_with_socket_warmup(
-    index: Arc<SpecialistIndex>,
-    ready: Arc<AtomicBool>,
-    socket_path: String,
-) {
-    use crate::fd_passing;
-    eprintln!(
-        "starting FD evented server on {} (defer /ready until socket warmup)",
-        socket_path
-    );
-    let ready_hook = Arc::clone(&ready);
-    let path_hook = socket_path.clone();
-    fd_passing::run_fd_evented_server_with_hook(
-        &socket_path,
-        move |req| handle_request(req, &index, &ready),
-        Some(move || {
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                warm_up_fd_passing(&path_hook);
-                ACCEPT_WARMUP.store(false, Ordering::Release);
-                ready_hook.store(true, Ordering::Release);
-                eprintln!("socket warmup complete, /ready");
-            });
-        }),
-    );
-}
-
 fn run_fd_mode_evented_with_self_warmup(
     index: Arc<SpecialistIndex>,
     ready: Arc<AtomicBool>,
@@ -221,36 +174,6 @@ fn run_fd_mode(index: Arc<SpecialistIndex>, ready: Arc<AtomicBool>, socket_path:
     fd_passing::run_fd_evented_server(socket_path, move |req| handle_request(req, &index, &ready));
 }
 
-fn mlock_current_and_future() {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mode = std::env::var("RINHA_MLOCK_ALL_MODE").unwrap_or_else(|_| "future".to_string());
-        let flags = match mode.as_str() {
-            "current" => libc::MCL_CURRENT,
-            "current-future" => libc::MCL_CURRENT | libc::MCL_FUTURE,
-            "future" => libc::MCL_FUTURE,
-            other => {
-                eprintln!("invalid RINHA_MLOCK_ALL_MODE='{}'; using MCL_FUTURE", other);
-                libc::MCL_FUTURE
-            }
-        };
-        if libc::mlockall(flags) != 0 {
-            eprintln!(
-                "mlockall({}) failed: {}",
-                mode,
-                std::io::Error::last_os_error()
-            );
-        } else {
-            eprintln!("mlockall({}) succeeded", mode);
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("mlockall is only supported on linux");
-    }
-}
-
 fn warm_up_index(index: &SpecialistIndex) {
     let count = runtime::warmup_queries();
     let scale = SCALE as usize;
@@ -265,47 +188,6 @@ fn warm_up_index(index: &SpecialistIndex) {
             };
         }
         let _ = index.predict_fraud_count(&query);
-    }
-}
-
-/// PGO training driver: replay a benchmark JSON (same `entries[].request` shape
-/// the harness uses) through the full request handler path, then return so the
-/// process exits cleanly and the LLVM instrumentation flushes its profile.
-/// Gated by `RINHA_PGO_TRAIN_JSON`; never runs in production.
-fn pgo_train(index: &SpecialistIndex, json_path: &str) {
-    let repeats: usize = std::env::var("RINHA_PGO_TRAIN_REPEATS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
-    let json_str = std::fs::read_to_string(json_path)
-        .unwrap_or_else(|e| panic!("pgo: read {}: {}", json_path, e));
-    let root: serde_json::Value =
-        serde_json::from_str(&json_str).unwrap_or_else(|e| panic!("pgo: parse json: {}", e));
-    let entries = root
-        .get("entries")
-        .and_then(|v| v.as_array())
-        .expect("pgo: missing entries array");
-
-    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(request) = entry.get("request") {
-            if let Ok(body) = serde_json::to_vec(request) {
-                bodies.push(body);
-            }
-        }
-    }
-    eprintln!(
-        "[pgo] replaying {} bodies x{} through handler path",
-        bodies.len(),
-        repeats
-    );
-
-    let ready = AtomicBool::new(true);
-    let mut request = Vec::with_capacity(4096);
-    for _ in 0..repeats {
-        for body in &bodies {
-            warm_up_payload_body(index, &ready, body, &mut request);
-        }
     }
 }
 
@@ -574,6 +456,18 @@ fn parse_response_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+fn build_warmup_http_post(body: &[u8], path: &[u8], host: &[u8], req: &mut Vec<u8>) {
+    req.clear();
+    req.extend_from_slice(b"POST ");
+    req.extend_from_slice(path);
+    req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    req.extend_from_slice(host);
+    req.extend_from_slice(b"\r\nContent-Length: ");
+    req.extend_from_slice(body.len().to_string().as_bytes());
+    req.extend_from_slice(b"\r\n\r\n");
+    req.extend_from_slice(body);
+}
+
 const WARMUP_PAYLOADS: &[&[u8]] = &[
     // --- LEGIT profile: low amount, low installments, low km_from_home, known merchant ---
     br#"{"id":"warmup-1","transaction":{"amount":441.59,"installments":1,"requested_at":"2027-07-09T16:31:06Z"},"customer":{"avg_amount":883.18,"tx_count_24h":1,"known_merchants":["MERC-004","MERC-017"]},"merchant":{"id":"MERC-004","mcc":"5411","avg_amount":302.78},"terminal":{"is_online":false,"card_present":true,"km_from_home":33.88},"last_transaction":{"timestamp":"2027-06-04T14:14:22Z","km_from_current":18.43}}"#,
@@ -651,107 +545,6 @@ fn handle_request(
         }
         _ => http::RESPONSE_NOT_FOUND,
     }
-}
-
-/// Exercise accept → epoll → buffer pool → handler on the real Unix fd-pass path.
-#[cfg(target_os = "linux")]
-fn warm_up_fd_passing(socket_path: &str) {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-    use std::os::unix::net::UnixStream;
-
-    let count = runtime::socket_warmup_requests();
-    let mut control = match UnixStream::connect(socket_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("socket warmup: connect {} failed: {}", socket_path, e);
-            return;
-        }
-    };
-
-    for i in 0..count {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
-            eprintln!("socket warmup: socketpair failed");
-            return;
-        }
-        let server_fd = fds[0];
-        let client_fd = fds[1];
-        if send_fd_over_unix(&mut control, server_fd).is_err() {
-            unsafe { libc::close(server_fd) };
-            unsafe { libc::close(client_fd) };
-            eprintln!("socket warmup: send_fd failed at {}", i);
-            return;
-        }
-        unsafe { libc::close(server_fd) };
-
-        let body = WARMUP_PAYLOADS[i % WARMUP_PAYLOADS.len()];
-        let mut client = unsafe { UnixStream::from_raw_fd(client_fd) };
-        let _ = client.set_nonblocking(false);
-        let req = build_warmup_post(body);
-        let _ = client.write_all(&req);
-        let _ = client.shutdown(std::net::Shutdown::Write);
-    }
-    drop(control);
-    eprintln!("socket warmup: sent {} fd-pass requests", count);
-}
-
-#[cfg(not(target_os = "linux"))]
-fn warm_up_fd_passing(_socket_path: &str) {}
-
-fn build_warmup_post(body: &[u8]) -> Vec<u8> {
-    let mut req = Vec::with_capacity(128 + body.len());
-    build_warmup_http_post(body, b"/fraud-score", b"localhost", &mut req);
-    req
-}
-
-fn build_warmup_http_post(body: &[u8], path: &[u8], host: &[u8], req: &mut Vec<u8>) {
-    req.clear();
-    req.extend_from_slice(b"POST ");
-    req.extend_from_slice(path);
-    req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    req.extend_from_slice(host);
-    req.extend_from_slice(b"\r\nContent-Length: ");
-    req.extend_from_slice(body.len().to_string().as_bytes());
-    req.extend_from_slice(b"\r\n\r\n");
-    req.extend_from_slice(body);
-}
-
-#[cfg(target_os = "linux")]
-fn send_fd_over_unix(
-    stream: &mut std::os::unix::net::UnixStream,
-    fd: std::os::fd::RawFd,
-) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, RawFd};
-    let buf = [0u8];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
-        iov_len: 1,
-    };
-    let mut cmsg_buf = [0u8; 64];
-    let cmsg_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-    let msg = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-        msg_controllen: cmsg_len as _,
-        msg_flags: 0,
-    };
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
-        *data = fd;
-        let sent = libc::sendmsg(stream.as_raw_fd(), &msg, 0);
-        if sent < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

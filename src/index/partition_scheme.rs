@@ -14,9 +14,9 @@ pub struct PartitionScheme {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LearnedPredicate {
-    pub dim: u8,
-    pub threshold: i16,
+struct Candidate {
+    dim: u8,
+    threshold: i16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,9 +49,6 @@ impl PartitionScheme {
     pub fn from_header(
         scheme_id: i16,
         scheme_param: usize,
-        _amount_cut_count: usize,
-        _dow_cut_count: usize,
-        _learned_predicates: Vec<LearnedPredicate>,
         tree_predicates: Vec<TreePredicate>,
     ) -> Result<Self, String> {
         if scheme_id != SCHEME_ID_LEARNED_TREE {
@@ -78,11 +75,7 @@ impl PartitionScheme {
         }
     }
 
-    pub fn compute_cuts(&self, _references: &[Reference]) -> Vec<i16> {
-        Vec::new()
-    }
-
-    pub fn compute_key(&self, vector: &QueryVector, _cuts: &[i16]) -> u32 {
+    pub fn compute_key(&self, vector: &QueryVector) -> u32 {
         compute_tree_key(vector, self.tree_depth, &self.tree_predicates)
     }
 }
@@ -151,7 +144,7 @@ fn train_tree_node(
     references: &[Reference],
     query_idx: &[usize],
     neighbors: &[[usize; K]],
-    candidates: &[LearnedPredicate],
+    candidates: &[Candidate],
     positions: &[usize],
     node: usize,
     depth: usize,
@@ -163,7 +156,7 @@ fn train_tree_node(
         return;
     }
 
-    let mut best: Option<(f64, LearnedPredicate)> = None;
+    let mut best: Option<(f64, Candidate)> = None;
     for &candidate in candidates {
         let mut left = 0usize;
         let mut right = 0usize;
@@ -264,7 +257,7 @@ fn train_tree_node(
     );
 }
 
-fn candidate_predicates(references: &[Reference]) -> Vec<LearnedPredicate> {
+fn candidate_predicates(references: &[Reference]) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for dim in 0..DIMS {
         let mut values: Vec<i16> = references.iter().map(|r| r.vector[dim]).collect();
@@ -276,7 +269,7 @@ fn candidate_predicates(references: &[Reference]) -> Vec<LearnedPredicate> {
 
         if values.len() <= 64 {
             for pair in values.windows(2) {
-                candidates.push(LearnedPredicate {
+                candidates.push(Candidate {
                     dim: dim as u8,
                     threshold: midpoint(pair[0], pair[1]),
                 });
@@ -285,7 +278,7 @@ fn candidate_predicates(references: &[Reference]) -> Vec<LearnedPredicate> {
             let n = values.len();
             for q in 1..16 {
                 let idx = ((n - 1) * q) / 16;
-                candidates.push(LearnedPredicate {
+                candidates.push(Candidate {
                     dim: dim as u8,
                     threshold: values[idx],
                 });
@@ -303,7 +296,7 @@ fn midpoint(a: i16, b: i16) -> i16 {
 }
 
 #[inline]
-fn predicate_matches(vector: &QueryVector, predicate: LearnedPredicate) -> bool {
+fn predicate_matches(vector: &QueryVector, predicate: Candidate) -> bool {
     vector[predicate.dim as usize] > predicate.threshold
 }
 
@@ -360,7 +353,7 @@ fn topk_one(references: &[Reference], qi: usize) -> [usize; K] {
     best_i
 }
 
-fn label_separation(references: &[Reference], predicate: LearnedPredicate) -> f64 {
+fn label_separation(references: &[Reference], predicate: Candidate) -> f64 {
     let mut pos = [0usize; 2];
     let mut total = [0usize; 2];
     for r in references

@@ -1,4 +1,4 @@
-use crate::index::partition_scheme::{LearnedPredicate, TreePredicate};
+use crate::index::partition_scheme::TreePredicate;
 use crate::{PACKED_DIMS, SCALE};
 
 pub struct IndexWriter {
@@ -15,10 +15,6 @@ impl IndexWriter {
         reference_count: i32,
         scheme_id: i16,
         scheme_param: i16,
-        amount_cut_count: i16,
-        dow_cut_count: i16,
-        cuts: &[i16],
-        learned_predicates: &[LearnedPredicate],
         tree_predicates: &[TreePredicate],
     ) -> Result<(), String> {
         self.buf.extend_from_slice(b"RNSPCST5");
@@ -30,18 +26,10 @@ impl IndexWriter {
         self.write_i32(0)?;
         self.write_i16(scheme_id)?;
         self.write_i16(scheme_param)?;
-        self.write_i16(amount_cut_count)?;
-        self.write_i16(dow_cut_count)?;
-        let predicate_count = learned_predicates.len() + tree_predicates.len();
-        self.write_i16(predicate_count as i16)?;
-        for &c in cuts {
-            self.write_i16(c)?;
-        }
-        for predicate in learned_predicates {
-            self.write_u8(predicate.dim)?;
-            self.write_u8(1)?;
-            self.write_i16(predicate.threshold)?;
-        }
+        // amount_cut_count, dow_cut_count: legacy fields, always 0.
+        self.write_i16(0)?;
+        self.write_i16(0)?;
+        self.write_i16(tree_predicates.len() as i16)?;
         for predicate in tree_predicates {
             self.write_u8(predicate.dim)?;
             self.write_u8(u8::from(predicate.enabled))?;
