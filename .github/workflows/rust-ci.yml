@@ -1,0 +1,21 @@
+name: rust-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test
+      - name: Validate local Compose
+        run: docker compose -f docker/compose.local.yml config -q

@@ -1,0 +1,14 @@
+target/
+data/
+results/
+docs/
+.git/
+test/
+tmp/
+local/
+privatedocs/
+.idea/
+scripts/
+k6/
+docker/Dockerfile.perf
+submission/

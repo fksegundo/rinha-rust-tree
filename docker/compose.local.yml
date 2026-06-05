@@ -1,0 +1,79 @@
+services:
+  api1:
+    image: rinha-rust-tree-api:local
+    pull_policy: never
+    restart: always
+    hostname: api1
+    cpuset: "0"
+    environment:
+     RINHA_SELF_WARMUP: "0"
+     RINHA_SELF_WARMUP_URL: "http://lb:9999/fraud-score"
+     RINHA_SELF_WARMUP_DURATION_MS: "30000"
+     RINHA_SELF_WARMUP_CONCURRENCY: "4"
+     RINHA_SELF_WARMUP_PAYLOADS: "/app/resources/warmup-payloads.jsonl"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api2:
+    image: rinha-rust-tree-api:local
+    pull_policy: never
+    restart: always
+    hostname: api2
+    cpuset: "1"
+    environment:
+     RINHA_SELF_WARMUP: "0"
+     RINHA_SELF_WARMUP_URL: "http://lb:9999/fraud-score"
+     RINHA_SELF_WARMUP_DURATION_MS: "30000"
+     RINHA_SELF_WARMUP_CONCURRENCY: "4"
+     RINHA_SELF_WARMUP_PAYLOADS: "/app/resources/warmup-payloads.jsonl"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  lb:
+    image: rinha-rust-tree-lb:local
+    pull_policy: never
+    restart: always
+    hostname: "lb"
+    user: "0:0"
+    cpuset: "2,3"
+    ports:
+      - "9999:9999"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=0777

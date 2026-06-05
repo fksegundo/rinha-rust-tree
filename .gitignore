@@ -1,0 +1,25 @@
+target/
+test/
+tmp/
+*.idx
+
+# Build/runtime artifacts.
+data/
+results/
+pgo-train.json
+pgo.profdata
+
+# Local-only inputs and experiments. Keep checked-in fixtures explicit.
+resources/*.json.gz
+resources/references.json
+resources/test-*.json
+scripts/
+k6/
+local/
+privatedocs/
+submission/
+
+# Editor and cache files.
+.idea/
+__pycache__/
+AGENTS.md

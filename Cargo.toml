@@ -1,0 +1,34 @@
+[package]
+name = "rinha-rust-tree"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+flate2 = "1.0"
+serde_json = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+threadpool = "1.8.1"
+mimalloc = "0.1.52"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = 0
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3
+
+[profile.release-perf]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
+[[bin]]
+name = "lb"
+path = "src/lb/main.rs"

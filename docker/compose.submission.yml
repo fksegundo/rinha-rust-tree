@@ -1,0 +1,72 @@
+services:
+  api1:
+    image: ghcr.io/fksegundo/rinha-rust-tree-api:latest
+    pull_policy: always
+    restart: always
+    hostname: api1
+    cpuset: "0"
+    logging:
+      driver: "none"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api2:
+    image: ghcr.io/fksegundo/rinha-rust-tree-api:latest
+    pull_policy: always
+    restart: always
+    hostname: api2
+    cpuset: "1"
+    logging:
+      driver: "none"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock: -1
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  lb:
+    image: ghcr.io/fksegundo/rinha-rust-tree-lb:latest
+    pull_policy: always
+    restart: always
+    user: "0:0"
+    cpuset: "2,3"
+    ports:
+      - "9999:9999"
+    logging:
+      driver: "none"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,uid=0,gid=0,mode=0777
