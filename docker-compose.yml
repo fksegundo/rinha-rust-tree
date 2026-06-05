@@ -7,6 +7,7 @@ services:
     cpuset: "0"
     environment:
      RINHA_SELF_WARMUP_DURATION_MS: "20000"
+     RINHA_SPIN_BEFORE_BLOCK_US: "50"
     logging:
       driver: "none"
     ulimits:
@@ -30,6 +31,7 @@ services:
     cpuset: "1"
     environment:
      RINHA_SELF_WARMUP_DURATION_MS: "20000"
+     RINHA_SPIN_BEFORE_BLOCK_US: "50"
     logging:
       driver: "none"
     ulimits:
@@ -53,8 +55,6 @@ services:
     cpuset: "2,3"
     ports:
       - "9999:9999"
-    environment:
-      LB_WORKER_MAP: "2:/sockets/api1.sock,3:/sockets/api2.sock"
     logging:
       driver: "none"
     ulimits:
