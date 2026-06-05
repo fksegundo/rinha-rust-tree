@@ -5,6 +5,8 @@ services:
     restart: always
     hostname: api1
     cpuset: "0"
+    environment:
+     RINHA_SELF_WARMUP_DURATION_MS: "20000"
     logging:
       driver: "none"
     ulimits:
@@ -26,6 +28,8 @@ services:
     restart: always
     hostname: api2
     cpuset: "1"
+    environment:
+     RINHA_SELF_WARMUP_DURATION_MS: "20000"
     logging:
       driver: "none"
     ulimits:
@@ -64,6 +68,10 @@ services:
         limits:
           cpus: "0.1"
           memory: "8M"
+
+networks:
+  rinha:
+    driver: bridge
 
 volumes:
   sockets:
